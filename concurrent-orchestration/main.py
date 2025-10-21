@@ -1,6 +1,8 @@
 import sys
 import warnings
 import asyncio
+import uuid
+from datetime import datetime
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -33,38 +35,61 @@ class MultiAgentConcurrentOrchestrator:
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
         parser = StrOutputParser()
         
-        # Create agent chains
+        # Create agent chains with custom names for LangSmith tracing
         self.shopping_chain = (
             ChatPromptTemplate.from_messages([
                 ("system", SHOPPING_AGENT_PROMPT + "\n\nConversation History: {chat_history}"),
                 ("human", "{input}")
             ]) | self.llm | parser
-        )
+        ).with_config({"run_name": "Shopping Agent"})
+        
         self.catalog_chain = (
             ChatPromptTemplate.from_messages([
                 ("system", PRODUCT_CATALOG_AGENT_PROMPT),
                 ("human", "{input}")
             ]) | self.llm | parser
-        )
+        ).with_config({"run_name": "Product Catalog Agent"})
+        
         self.customer_service_chain = (
             ChatPromptTemplate.from_messages([
                 ("system", CUSTOMER_SERVICE_AGENT_PROMPT),
                 ("human", "{input}")
             ]) | self.llm | parser
-        )
+        ).with_config({"run_name": "Customer Service Agent"})
+        
         self.payment_chain = (
             ChatPromptTemplate.from_messages([
                 ("system", PAYMENT_AGENT_PROMPT),
                 ("human", "{input}")
             ]) | self.llm | parser
-        )
+        ).with_config({"run_name": "Payment Agent"})
     
     async def orchestrate_async(self, user_input):
         """Async orchestration logic with concurrent agent execution"""
+        # Generate unique transaction ID
+        transaction_id = str(uuid.uuid4())
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Create config with transaction metadata
+        run_config = {
+            "tags": [f"transaction:{transaction_id}"],
+            "metadata": {
+                "transaction_id": transaction_id,
+                "timestamp": timestamp,
+                "user_input": user_input[:100]  # First 100 chars
+            }
+        }
+        
+        print(f"[Transaction ID: {transaction_id}]")
+        print(f"[Timestamp: {timestamp}]\n")
+        
         # Step 1: Shopping agent
         print("[1/4] Shopping Agent...")
         chat_history = self.memory.load_memory_variables({}).get("chat_history", [])
-        shopping_result = self.shopping_chain.invoke({"input": user_input, "chat_history": chat_history})
+        shopping_result = self.shopping_chain.invoke(
+            {"input": user_input, "chat_history": chat_history},
+            config=run_config
+        )
         print(f"      {shopping_result}\n")
         
         # Step 2 & 3: Check if ready to purchase
@@ -74,10 +99,10 @@ class MultiAgentConcurrentOrchestrator:
             
             # Run catalog and customer service agents concurrently
             catalog_task = asyncio.to_thread(
-                self.catalog_chain.invoke, {"input": shopping_result}
+                self.catalog_chain.invoke, {"input": shopping_result}, run_config
             )
             service_task = asyncio.to_thread(
-                self.customer_service_chain.invoke, {"input": shopping_result}
+                self.customer_service_chain.invoke, {"input": shopping_result}, run_config
             )
             
             catalog_result, service_result = await asyncio.gather(catalog_task, service_task)
@@ -94,7 +119,10 @@ Customer Service Information:
 
 Original Request: {shopping_result}
 """
-            payment_result = self.payment_chain.invoke({"input": combined_input})
+            payment_result = self.payment_chain.invoke(
+                {"input": combined_input},
+                config=run_config
+            )
             print("      Complete\n")
             
             print("=" * 60)
