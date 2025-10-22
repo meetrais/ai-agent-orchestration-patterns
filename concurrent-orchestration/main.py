@@ -3,9 +3,9 @@ import warnings
 import asyncio
 import uuid
 from datetime import datetime
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, AIMessage
+from langsmith import traceable
 from dotenv import load_dotenv
 import os
 from prompts import (
@@ -33,36 +33,46 @@ class MultiAgentConcurrentOrchestrator:
             temperature=0.4
         )
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        parser = StrOutputParser()
-        
-        # Create agent chains with custom names for LangSmith tracing
-        self.shopping_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", SHOPPING_AGENT_PROMPT + "\n\nConversation History: {chat_history}"),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Shopping Agent"})
-        
-        self.catalog_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", PRODUCT_CATALOG_AGENT_PROMPT),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Product Catalog Agent"})
-        
-        self.customer_service_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", CUSTOMER_SERVICE_AGENT_PROMPT),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Customer Service Agent"})
-        
-        self.payment_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", PAYMENT_AGENT_PROMPT),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Payment Agent"})
+    
+    @traceable(run_type="llm", name="Shopping Agent")
+    def call_shopping_agent(self, user_input, chat_history, config=None):
+        """Call shopping agent with user input"""
+        messages = [
+            SystemMessage(content=f"{SHOPPING_AGENT_PROMPT}\n\nConversation History: {chat_history}"),
+            AIMessage(content=f"User request: {user_input}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
+    
+    @traceable(run_type="llm", name="Product Catalog Agent")
+    def call_catalog_agent(self, shopping_output, config=None):
+        """Call catalog agent with shopping agent output"""
+        messages = [
+            SystemMessage(content=PRODUCT_CATALOG_AGENT_PROMPT),
+            AIMessage(content=f"Shopping Agent output: {shopping_output}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
+    
+    @traceable(run_type="llm", name="Customer Service Agent")
+    def call_customer_service_agent(self, shopping_output, config=None):
+        """Call customer service agent with shopping agent output"""
+        messages = [
+            SystemMessage(content=CUSTOMER_SERVICE_AGENT_PROMPT),
+            AIMessage(content=f"Shopping Agent output: {shopping_output}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
+    
+    @traceable(run_type="llm", name="Payment Agent")
+    def call_payment_agent(self, catalog_output, service_output, shopping_output, config=None):
+        """Call payment agent with catalog and service agent outputs"""
+        messages = [
+            SystemMessage(content=PAYMENT_AGENT_PROMPT),
+            AIMessage(content=f"Catalog Agent output: {catalog_output}\n\nCustomer Service Agent output: {service_output}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
     
     async def orchestrate_async(self, user_input):
         """Async orchestration logic with concurrent agent execution"""
@@ -86,10 +96,8 @@ class MultiAgentConcurrentOrchestrator:
         # Step 1: Shopping agent
         print("[1/4] Shopping Agent...")
         chat_history = self.memory.load_memory_variables({}).get("chat_history", [])
-        shopping_result = self.shopping_chain.invoke(
-            {"input": user_input, "chat_history": chat_history},
-            config=run_config
-        )
+        
+        shopping_result = self.call_shopping_agent(user_input, chat_history, config=run_config)
         print(f"      {shopping_result}\n")
         
         # Step 2 & 3: Check if ready to purchase
@@ -99,10 +107,10 @@ class MultiAgentConcurrentOrchestrator:
             
             # Run catalog and customer service agents concurrently
             catalog_task = asyncio.to_thread(
-                self.catalog_chain.invoke, {"input": shopping_result}, run_config
+                self.call_catalog_agent, shopping_result, run_config
             )
             service_task = asyncio.to_thread(
-                self.customer_service_chain.invoke, {"input": shopping_result}, run_config
+                self.call_customer_service_agent, shopping_result, run_config
             )
             
             catalog_result, service_result = await asyncio.gather(catalog_task, service_task)
@@ -110,19 +118,8 @@ class MultiAgentConcurrentOrchestrator:
             
             # Step 4: Payment agent with combined results
             print("[4/4] Payment Agent...")
-            combined_input = f"""
-Catalog Information:
-{catalog_result}
-
-Customer Service Information:
-{service_result}
-
-Original Request: {shopping_result}
-"""
-            payment_result = self.payment_chain.invoke(
-                {"input": combined_input},
-                config=run_config
-            )
+            
+            payment_result = self.call_payment_agent(catalog_result, service_result, shopping_result, config=run_config)
             print("      Complete\n")
             
             print("=" * 60)

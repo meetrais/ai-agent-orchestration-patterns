@@ -2,9 +2,9 @@ import sys
 import warnings
 import uuid
 from datetime import datetime
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import SystemMessage, AIMessage
+from langsmith import traceable
 from dotenv import load_dotenv
 import os
 from prompts import SHOPPING_AGENT_PROMPT, PRODUCT_CATALOG_AGENT_PROMPT, PAYMENT_AGENT_PROMPT
@@ -27,29 +27,36 @@ class MultiAgentSequentialOrchestrator:
             temperature=0.4
         )
         self.memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        parser = StrOutputParser()
-        
-        # Create agent chains with custom names for LangSmith tracing
-        self.shopping_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", SHOPPING_AGENT_PROMPT + "\n\nConversation History: {chat_history}"),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Shopping Agent"})
-        
-        self.catalog_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", PRODUCT_CATALOG_AGENT_PROMPT),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Product Catalog Agent"})
-        
-        self.payment_chain = (
-            ChatPromptTemplate.from_messages([
-                ("system", PAYMENT_AGENT_PROMPT),
-                ("human", "{input}")
-            ]) | self.llm | parser
-        ).with_config({"run_name": "Payment Agent"})
+    
+    @traceable(run_type="llm", name="Shopping Agent")
+    def call_shopping_agent(self, user_input, chat_history, config=None):
+        """Call shopping agent with user input"""
+        messages = [
+            SystemMessage(content=f"{SHOPPING_AGENT_PROMPT}\n\nConversation History: {chat_history}"),
+            AIMessage(content=f"User request: {user_input}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
+    
+    @traceable(run_type="llm", name="Product Catalog Agent")
+    def call_catalog_agent(self, shopping_output, config=None):
+        """Call catalog agent with shopping agent output"""
+        messages = [
+            SystemMessage(content=PRODUCT_CATALOG_AGENT_PROMPT),
+            AIMessage(content=f"Shopping Agent output: {shopping_output}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
+    
+    @traceable(run_type="llm", name="Payment Agent")
+    def call_payment_agent(self, catalog_output, config=None):
+        """Call payment agent with catalog agent output"""
+        messages = [
+            SystemMessage(content=PAYMENT_AGENT_PROMPT),
+            AIMessage(content=f"Catalog Agent output: {catalog_output}")
+        ]
+        response = self.llm.invoke(messages, config=config)
+        return response.content if hasattr(response, 'content') else str(response)
     
     def orchestrate(self, user_input):
         """Main orchestration logic"""
@@ -73,26 +80,20 @@ class MultiAgentSequentialOrchestrator:
         # Step 1: Shopping agent
         print("[1/3] Shopping Agent...")
         chat_history = self.memory.load_memory_variables({}).get("chat_history", [])
-        shopping_result = self.shopping_chain.invoke(
-            {"input": user_input, "chat_history": chat_history},
-            config=run_config
-        )
+        
+        shopping_result = self.call_shopping_agent(user_input, chat_history, config=run_config)
         print(f"      {shopping_result}\n")
         
         # Step 2: Check if ready to purchase
         if "READY_TO_PURCHASE:" in shopping_result:
             print("[2/3] Product Catalog Agent...")
-            catalog_result = self.catalog_chain.invoke(
-                {"input": shopping_result},
-                config=run_config
-            )
+            
+            catalog_result = self.call_catalog_agent(shopping_result, config=run_config)
             print("      Complete")
             
             print("[3/3] Payment Agent...")
-            payment_result = self.payment_chain.invoke(
-                {"input": catalog_result},
-                config=run_config
-            )
+            
+            payment_result = self.call_payment_agent(catalog_result, config=run_config)
             print("      Complete\n")
             
             print("=" * 60)
